@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Backend shim for java^(...)_java blocks.
+
+Compiles code with javac, runs it with java, and captures stdout.
+The code must contain a class with a public static void main method.
+"""
+import sys
+import json
+import subprocess
+import tempfile
+import os
+import re
+import traceback
+
+
+def send_ok(value):
+    print(json.dumps({"status": "ok", "value": value}), flush=True)
+
+
+def send_err(message):
+    print(json.dumps({"status": "err", "message": message}), flush=True)
+
+
+def find_public_class(code):
+    """Extract the public class name from Java source code."""
+    m = re.search(r'\bpublic\s+class\s+(\w+)', code)
+    if m:
+        return m.group(1)
+    # Fallback: find any class name
+    m = re.search(r'\bclass\s+(\w+)', code)
+    if m:
+        return m.group(1)
+    return "Main"
+
+
+def handle_exec(cmd):
+    code = cmd.get("code", "")
+
+    try:
+        class_name = find_public_class(code)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, f"{class_name}.java")
+
+            with open(src, "w") as f:
+                f.write(code)
+
+            # Compile
+            comp = subprocess.run(
+                ["javac", src],
+                capture_output=True, text=True, timeout=120,
+            )
+            if comp.returncode != 0:
+                stderr = comp.stderr.strip()
+                send_err(f"javac compilation failed\n{stderr}")
+                return
+
+            # Run
+            result = subprocess.run(
+                ["java", "-cp", tmpdir, class_name],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                send_err(f"java exited with code {result.returncode}\n{stderr}")
+            else:
+                output = result.stdout
+                if output.endswith("\n"):
+                    output = output[:-1]
+                send_ok({"t": "str", "v": output})
+
+    except subprocess.TimeoutExpired:
+        send_err("Java compilation or execution timed out")
+    except FileNotFoundError:
+        send_err("javac/java is not installed or not in PATH")
+    except Exception:
+        send_err(traceback.format_exc())
+
+
+for line in sys.stdin:
+    try:
+        cmd = json.loads(line)
+        tag = cmd.get("cmd")
+
+        if tag == "exec":
+            handle_exec(cmd)
+        elif tag == "cleanup":
+            send_ok({"t": "null"})
+        elif tag == "ping":
+            send_ok({"t": "null"})
+        else:
+            send_err(f"unknown command: {tag!r}")
+
+    except Exception:
+        send_err(traceback.format_exc())
